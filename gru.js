@@ -1,4 +1,4 @@
-// gru.js (обновленная версия)
+// gru.js (версия с расчетом RMSE)
 class GRUModel {
     constructor(windowSize = 60, predictionHorizon = 5) {
         this.windowSize = windowSize;
@@ -6,7 +6,8 @@ class GRUModel {
         this.model = null;
         this.isTrained = false;
         this.batchSize = 32;
-        this.trainingHistory = []; // Сохраняем историю обучения для расчета RMSE
+        this.trainingHistory = []; // Сохраняем историю обучения
+        this.lastRMSE = 0; // Сохраняем последний расчет RMSE
     }
 
     buildModel() {
@@ -57,6 +58,7 @@ class GRUModel {
         console.log('✅ GRU Model built');
         this.isTrained = false;
         this.trainingHistory = [];
+        this.lastRMSE = 0;
         
         return this.model;
     }
@@ -78,7 +80,7 @@ class GRUModel {
         console.log(`Training: ${sampleCount} samples, batch=${batchSize}, epochs=${epochs}`);
         
         const startTime = Date.now();
-        this.trainingHistory = []; // Сбрасываем историю
+        this.trainingHistory = [];
         
         try {
             // Простое обучение с сохранением истории
@@ -87,24 +89,40 @@ class GRUModel {
                 batchSize: batchSize,
                 validationSplit: 0.1,
                 verbose: 0,
-                shuffle: true
+                shuffle: true,
+                callbacks: {
+                    onEpochEnd: (epoch, logs) => {
+                        this.trainingHistory.push({
+                            epoch: epoch + 1,
+                            loss: logs.loss,
+                            val_loss: logs.val_loss
+                        });
+                        
+                        if (callbacks.onEpochEnd) {
+                            callbacks.onEpochEnd(epoch, logs);
+                        }
+                        
+                        // Логируем прогресс
+                        console.log(`Epoch ${epoch + 1}/${epochs} - loss: ${logs.loss.toFixed(6)}`);
+                    }
+                }
             });
             
-            // Сохраняем историю для расчета RMSE
-            this.trainingHistory = history.history;
             this.isTrained = true;
-            
-            console.log(`✅ Training completed in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
-            console.log('Training history:', this.trainingHistory);
             
             // Рассчитываем RMSE из последнего значения MSE
             let rmse = 0;
             let mse = 0;
             
-            if (this.trainingHistory.loss && this.trainingHistory.loss.length > 0) {
-                mse = this.trainingHistory.loss[this.trainingHistory.loss.length - 1];
+            if (this.trainingHistory.length > 0) {
+                const lastEpoch = this.trainingHistory[this.trainingHistory.length - 1];
+                mse = lastEpoch.loss || 0;
                 rmse = Math.sqrt(Math.max(mse, 0));
+                this.lastRMSE = rmse;
             }
+            
+            console.log(`✅ Training completed in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+            console.log(`Final RMSE: ${(rmse * 100).toFixed(3)}%`);
             
             if (callbacks.onTrainEnd) {
                 callbacks.onTrainEnd(rmse);
@@ -134,7 +152,12 @@ class GRUModel {
             const predictionsArray = await predictions.array();
             predictions.dispose();
             
-            return predictionsArray;
+            // Проверяем на NaN
+            const cleanPredictions = predictionsArray.map(preds => 
+                preds.map(p => isNaN(p) || !isFinite(p) ? 0 : p)
+            );
+            
+            return cleanPredictions;
         } catch (error) {
             console.error('Prediction error:', error);
             return [Array(this.predictionHorizon).fill(0)];
@@ -144,7 +167,13 @@ class GRUModel {
     // НОВЫЙ МЕТОД: расчет RMSE на тестовых данных
     async calculateRMSE(X_test, y_test) {
         if (!this.model || !this.isTrained) {
-            return { rmse: 0, mse: 0, sampleCount: 0 };
+            return { 
+                rmse: 0, 
+                mse: 0, 
+                sampleCount: 0,
+                predictions: [],
+                actual: [] 
+            };
         }
 
         try {
@@ -157,22 +186,40 @@ class GRUModel {
             
             // Рассчитываем RMSE
             let totalSquaredError = 0;
+            let totalAbsoluteError = 0;
             let sampleCount = 0;
+            let correctDirection = 0;
             
             for (let i = 0; i < predArray.length; i++) {
                 for (let j = 0; j < predArray[i].length; j++) {
-                    const error = actualArray[i][j] - predArray[i][j];
+                    const actual = actualArray[i][j];
+                    const predicted = predArray[i][j];
+                    const error = actual - predicted;
+                    
                     totalSquaredError += error * error;
+                    totalAbsoluteError += Math.abs(error);
                     sampleCount++;
+                    
+                    // Проверяем направление
+                    if ((actual >= 0 && predicted >= 0) || 
+                        (actual < 0 && predicted < 0)) {
+                        correctDirection++;
+                    }
                 }
             }
             
             const mse = totalSquaredError / Math.max(sampleCount, 1);
             const rmse = Math.sqrt(Math.max(mse, 0));
+            const mae = totalAbsoluteError / Math.max(sampleCount, 1);
+            const directionAccuracy = (correctDirection / Math.max(sampleCount, 1)) * 100;
+            
+            this.lastRMSE = rmse;
             
             return {
                 rmse: rmse,
                 mse: mse,
+                mae: mae,
+                directionAccuracy: directionAccuracy,
                 sampleCount: sampleCount,
                 predictions: predArray,
                 actual: actualArray
@@ -180,19 +227,31 @@ class GRUModel {
             
         } catch (error) {
             console.error('RMSE calculation error:', error);
-            return { rmse: 0, mse: 0, sampleCount: 0 };
+            return { 
+                rmse: 0, 
+                mse: 0, 
+                mae: 0,
+                directionAccuracy: 0,
+                sampleCount: 0 
+            };
         }
     }
 
-    // Метод для расчета RMSE на последних данных (более реалистичный)
+    // Метод для расчета RMSE на последних данных
     async calculateValidationRMSE(normalizedData, windowSize = 60, horizon = 5) {
-        if (!this.model || !this.isTrained || !normalizedData) {
-            return { rmse: 0, sampleCount: 0 };
+        if (!this.model || !this.isTrained || !normalizedData || normalizedData.length < 100) {
+            return { 
+                rmse: 0, 
+                mse: 0, 
+                mae: 0,
+                directionAccuracy: 0,
+                sampleCount: 0 
+            };
         }
         
         try {
-            // Используем последние 30% данных для валидации
-            const validationSize = Math.floor(normalizedData.length * 0.3);
+            // Используем последние 20% данных для валидации
+            const validationSize = Math.floor(normalizedData.length * 0.2);
             const validationData = normalizedData.slice(-validationSize);
             
             const sequences = [];
@@ -205,7 +264,13 @@ class GRUModel {
             }
             
             if (sequences.length === 0) {
-                return { rmse: 0, sampleCount: 0 };
+                return { 
+                    rmse: 0, 
+                    mse: 0, 
+                    mae: 0,
+                    directionAccuracy: 0,
+                    sampleCount: 0 
+                };
             }
             
             // Создаем тензоры
@@ -223,8 +288,19 @@ class GRUModel {
             
         } catch (error) {
             console.error('Validation RMSE error:', error);
-            return { rmse: 0, sampleCount: 0 };
+            return { 
+                rmse: 0, 
+                mse: 0, 
+                mae: 0,
+                directionAccuracy: 0,
+                sampleCount: 0 
+            };
         }
+    }
+
+    // Метод для быстрого получения последнего RMSE
+    getLastRMSE() {
+        return this.lastRMSE;
     }
 
     getTrainingHistory() {
@@ -238,6 +314,7 @@ class GRUModel {
         }
         this.isTrained = false;
         this.trainingHistory = [];
+        this.lastRMSE = 0;
     }
 }
 
